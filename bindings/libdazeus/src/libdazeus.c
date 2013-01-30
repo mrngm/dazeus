@@ -46,9 +46,7 @@
 #include <ctype.h>
 #include <assert.h>
 
-#include <libjson.h>
-
-char *_workaround_json_encoding_bug(char *buf, int *bufsize);
+#include <jansson.h>
 
 void _connect(dazeus *d)
 {
@@ -132,17 +130,15 @@ void _connect(dazeus *d)
 	assert(d->socket);
 }
 
-int _send(dazeus *d, JSONNODE *node) {
+int _send(dazeus *d, json_t *node) {
 	_connect(d);
 	if(!d->socket) {
 		return -1;
 	}
-	json_char *raw_json = json_write(node);
-	// TODO is json_char char or wchar_t here?
-	// what happens with size if it is wchar?
+	char *raw_json = json_dumps(node, 0);
 	int size = strlen(raw_json);
 	dprintf(d->socket, "%d%s\n", size, raw_json);
-	json_free(raw_json);
+	free(raw_json);
 	return size;
 }
 
@@ -187,14 +183,14 @@ int _append_buffer(dazeus *d, int timeout, int disregard_timeout) {
 	return r;
 }
 
-// Don't forget to free the JSONNODE returned via 'result'
-// using json_delete()!
+// Don't forget to free the json_t returned via 'result'
+// using json_decref()!
 // timeout=-1 => try indefinitely
 // timeout=0  => try exactly once
 // timeout>0  => try that many seconds
 // (in every case, the first call to read() will be non-blocking in case
 //  there is already data waiting to be parsed, and no data on the socket)
-int _readPacket(dazeus *d, int timeout, JSONNODE **result) {
+int _readPacket(dazeus *d, int timeout, json_t **result) {
 	// TODO implement timeout well in read()
 	assert(result != NULL);
 	*result = 0;
@@ -272,8 +268,8 @@ int _readPacket(dazeus *d, int timeout, JSONNODE **result) {
 			memmove(d->readahead, d->readahead + i + json_size, d->readahead_size - i - json_size);
 			d->readahead_size -= i + json_size;
 
-			buf = _workaround_json_encoding_bug(buf, &json_size);
-			JSONNODE *message = json_parse(buf);
+			json_error_t error;
+			json_t *message = json_loads(buf, 0, &error);
 			if(message == NULL) {
 				close(d->socket);
 				d->socket = 0;
@@ -291,28 +287,26 @@ int _readPacket(dazeus *d, int timeout, JSONNODE **result) {
 	return 0;
 }
 
-dazeus_event *_event_from_json(dazeus *d, JSONNODE *event) {
-	JSONNODE_ITERATOR eventIt = json_find(event, "event");
-	if(eventIt == json_end(event)) {
+dazeus_event *_event_from_json(dazeus *d, json_t *event) {
+	json_t *eventIt = json_object_get(event, "event");
+	if(!eventIt) {
 		d->error = "Couldn't find event name in received event";
 		return NULL;
 	}
 
-	JSONNODE_ITERATOR paramsIt = json_find(event, "params");
-	if(paramsIt == json_end(event)) {
+	json_t *paramsIt = json_object_get(event, "params");
+	if(!paramsIt) {
 		d->error = "Couldn't find params in received event";
 		return NULL;
 	}
 
 	dazeus_stringlist *params = 0;
 	dazeus_stringlist *cur = 0;
-	JSONNODE_ITERATOR curParam = json_begin(*paramsIt);
-	while(curParam != json_end(*paramsIt)) {
+	for(int i = 0; i < json_array_size(paramsIt); ++i) {
+		json_t *curParam = json_array_get(paramsIt, i);
 		dazeus_stringlist *new = malloc(sizeof(dazeus_stringlist));
 		new->next = 0;
-		json_char *s = json_as_string(*curParam);
-		new->value = strdup(s);
-		json_free(s);
+		new->value = strdup(json_string_value(curParam));
 
 		if(params == 0) {
 			params = cur = new;
@@ -320,34 +314,36 @@ dazeus_event *_event_from_json(dazeus *d, JSONNODE *event) {
 			cur->next = new;
 			cur = new;
 		}
-
-		++curParam;
 	}
 
 	dazeus_event *e = malloc(sizeof(dazeus_event));
 	e->_next = 0;
 	e->parameters = params;
 
-	json_char *ev = json_as_string(*eventIt);
-	e->event = strdup(ev);
-	json_free(ev);
-
+	e->event = strdup(json_string_value(eventIt));
 	return e;
 }
 
 // Read incoming JSON requests until a non-event comes in (blocking)
-int _read(dazeus *d, JSONNODE **result) {
+int _read(dazeus *d, json_t **result) {
 	assert(result != NULL);
 	*result = 0;
 	while(1) {
-		JSONNODE *res = 0;
+		json_t *res = 0;
 		if(_readPacket(d, -1, &res) <= 0) {
 			// read error
 			return 0;
 		}
 		if(res != NULL) {
-			JSONNODE_ITERATOR eventIt = json_find(res, "event");
-			if(eventIt != json_end(res)) {
+			if(!json_is_object(res)) {
+				close(d->socket);
+				d->socket = 0;
+				d->error = "Invalid format of JSON data to socket (not an object)";
+				json_decref(res);
+				continue;
+			}
+			json_t *event = json_object_get(res, "event");
+			if(event != NULL) {
 				// It's an event, add it to the chain
 				dazeus_event *e = _event_from_json(d, res);
 				if(d->event == 0) {
@@ -359,7 +355,7 @@ int _read(dazeus *d, JSONNODE **result) {
 					d->lastEvent->_next = e;
 					d->lastEvent = e;
 				}
-				json_delete(res);
+				json_decref(res);
 			} else {
 				*result = res;
 				return 1;
@@ -368,44 +364,45 @@ int _read(dazeus *d, JSONNODE **result) {
 	}
 }
 
-int _check_success(dazeus *d, JSONNODE *response) {
-	JSONNODE *success = json_pop_back(response, "success");
+int _check_success(dazeus *d, json_t *response) {
+	json_t *success = json_object_get(response, "success");
 	if(success == NULL) {
 		d->error = "No 'success' field in response.";
 		return 0;
 	}
-	json_char *succval = json_as_string(success);
-	if(strcmp(succval, "true") != 0) {
+	int is_success = (json_is_string(success) && strcmp(json_string_value(success), "true") != 0)
+		|| (json_is_boolean(success) && json_typeof(success) == JSON_TRUE);
+
+	int result = 1;
+	if(!is_success) {
 		d->error = "Request failed, no error";
-		JSONNODE *error = json_pop_back(response, "error");
-		if(error) {
-			d->error = json_as_string(error);
+		json_t *error = json_object_get(response, "error");
+		if(error && json_is_string(error)) {
+			d->error = strdup(json_string_value(error));
 		}
-		json_delete(error);
-		json_free(succval);
-		json_delete(success);
-		return 0;
+		result = 0;
 	}
-	json_free(succval);
-	json_delete(success);
-	return 1;
+	return result;
 }
 
-dazeus_stringlist *_jsonarray_to_stringlist(JSONNODE *array) {
-	if(json_type(array) != JSON_ARRAY)
+dazeus_stringlist *_jsonarray_to_stringlist(json_t *array) {
+	if(!json_is_array(array))
 		return NULL;
 
-	JSONNODE_ITERATOR it = json_begin(array);
 	dazeus_stringlist *first = 0;
 	dazeus_stringlist *cur = first;
-	while(it != json_end(array)) {
-		JSONNODE *item = *it;
+	for(int i = 0; i < json_array_size(array); ++i) {
+		json_t *item = json_array_get(array, i);
 
 		dazeus_stringlist *new = malloc(sizeof(dazeus_stringlist));
-		json_char *value = json_as_string(item);
+		const char *value;
+		if(json_is_string(item)) {
+			value = json_string_value(item);
+		} else {
+			value = "[[complex object in JSON]]";
+		}
 		new->value = malloc(strlen(value) + 1);
 		strcpy(new->value, value);
-		json_free(value);
 		new->next = 0;
 		if(first == 0) {
 			first = new;
@@ -414,14 +411,12 @@ dazeus_stringlist *_jsonarray_to_stringlist(JSONNODE *array) {
 			cur->next = new;
 			cur = new;
 		}
-		it++;
 	}
 	return first;
 }
 
-JSONNODE *_add_scope(dazeus *d, dazeus_scope *s) {
-	JSONNODE *scope = json_new(JSON_ARRAY);
-	json_set_name(scope, "scope");
+json_t *_add_scope(dazeus *d, dazeus_scope *s) {
+	json_t *scope = json_array();
 
 	if(s->scope_type == DAZEUS_GLOBAL_SCOPE) {
 		return scope; // don't add anything
@@ -434,15 +429,12 @@ JSONNODE *_add_scope(dazeus *d, dazeus_scope *s) {
 	}
 	assert(s->scope_type & DAZEUS_NETWORK_SCOPE);
 
-	JSONNODE *netp = json_new_a("", s->network);
-	json_push_back(scope, netp);
+	json_array_append_new(scope, json_string(s->network));
 
 	if(s->scope_type & DAZEUS_RECEIVER_SCOPE) {
-		JSONNODE *recvp = json_new_a("", s->receiver);
-		json_push_back(scope, recvp);
+		json_array_append_new(scope, json_string(s->receiver));
 		if(s->scope_type & DAZEUS_SENDER_SCOPE) {
-			JSONNODE *sendp = json_new_a("", s->sender);
-			json_push_back(scope, sendp);
+			json_array_append_new(scope, json_string(s->sender));
 		}
 	} else {
 		assert((s->scope_type & DAZEUS_SENDER_SCOPE) == 0);
@@ -575,38 +567,35 @@ dazeus_stringlist *libdazeus_networks(dazeus *d)
 {
 	d->error = 0;
 	// {'get':'networks'}
-	JSONNODE *fulljson = json_new(JSON_NODE);
-	JSONNODE *request  = json_new_a("get", "networks");
-	json_push_back(fulljson,request);
+	json_t *fulljson = json_object();
+	json_object_set_new(fulljson, "get", json_string("networks"));
 	_send(d, fulljson);
-	json_delete(fulljson);
+	json_decref(fulljson);
 
-	JSONNODE *response;
+	json_t *response;
 	if(!_read(d, &response)) {
 		return NULL;
 	}
 
 	if(!_check_success(d, response)) {
-		json_delete(response);
+		json_decref(response);
 		return NULL;
 	}
 
-	JSONNODE *networks = json_pop_back(response, "networks");
+	json_t *networks = json_object_get(response, "networks");
 	if(networks == NULL) {
-		json_delete(response);
+		json_decref(response);
 		d->error = "No networks present in reply";
 		return NULL;
 	}
-	if(json_type(networks) != JSON_ARRAY) {
-		json_delete(networks);
-		json_delete(response);
+	if(!json_is_array(networks)) {
+		json_decref(response);
 		d->error = "Networks in reply wasn't an array";
 		return NULL;
 	}
 	dazeus_stringlist *list = _jsonarray_to_stringlist(networks);
 
-	json_delete(networks);
-	json_delete(response);
+	json_decref(response);
 	return list;
 }
 
@@ -619,43 +608,39 @@ dazeus_stringlist *libdazeus_channels(dazeus *d, const char *network)
 {
 	d->error = 0;
 	// {'get':'channels','params':['networkname']}
-	JSONNODE *fulljson = json_new(JSON_NODE);
-	JSONNODE *request  = json_new_a("get", "channels");
-	JSONNODE *params   = json_new(JSON_ARRAY);
-	json_set_name(params, "params");
-	JSONNODE *param1   = json_new_a("", network);
-	json_push_back(params, param1);
-	json_push_back(fulljson, request);
-	json_push_back(fulljson, params);
-	_send(d, fulljson);
-	json_delete(fulljson);
+	json_t *fulljson = json_object();
+	json_object_set_new(fulljson, "get", json_string("channels"));
 
-	JSONNODE *response;
+	json_t *params   = json_array();
+	json_array_append_new(params, json_string(network));
+	json_object_set_new(fulljson, "params", params);
+	_send(d, fulljson);
+	json_decref(fulljson);
+
+	json_t *response;
 	if(!_read(d, &response)) {
 		return NULL;
 	}
 
 	if(!_check_success(d, response)) {
-		json_delete(response);
+		json_decref(response);
 		return NULL;
 	}
 
-	JSONNODE *channels = json_pop_back(response, "channels");
+	json_t *channels = json_object_get(response, "channels");
 	if(channels == NULL) {
-		json_delete(response);
+		json_decref(response);
 		d->error = "Reply didn't have channels";
 		return NULL;
 	}
-	if(json_type(channels) != JSON_ARRAY) {
-		json_delete(channels);
-		json_delete(response);
+	if(!json_is_array(channels)) {
+		json_decref(response);
 		d->error = "Channels in reply wasn't an array";
 		return NULL;
 	}
 	dazeus_stringlist *list = _jsonarray_to_stringlist(channels);
 
-	json_delete(channels);
-	json_delete(response);
+	json_decref(response);
 	return list;
 }
 
@@ -666,32 +651,28 @@ int libdazeus_message(dazeus *d, const char *network, const char *receiver, cons
 {
 	d->error = 0;
 	// {'do':'message','params':['network','recv','message']}
-	JSONNODE *fulljson = json_new(JSON_NODE);
-	JSONNODE *request  = json_new_a("do", "message");
-	JSONNODE *params   = json_new(JSON_ARRAY);
-	JSONNODE *p1       = json_new_a("", network);
-	JSONNODE *p2       = json_new_a("", receiver);
-	JSONNODE *p3       = json_new_a("", message);
-	json_set_name(params, "params");
-	json_push_back(params, p1);
-	json_push_back(params, p2);
-	json_push_back(params, p3);
-	json_push_back(fulljson, request);
-	json_push_back(fulljson, params);
-	_send(d, fulljson);
-	json_delete(fulljson);
+	json_t *fulljson = json_object();
+	json_object_set_new(fulljson, "do", json_string("message"));
 
-	JSONNODE *response;
+	json_t *params   = json_array();
+	json_array_append_new(params, json_string(network));
+	json_array_append_new(params, json_string(receiver));
+	json_array_append_new(params, json_string(message));
+	json_object_set_new(fulljson, "params", params);
+	_send(d, fulljson);
+	json_decref(fulljson);
+
+	json_t *response;
 	if(!_read(d, &response)) {
 		return 0;
 	}
 
 	if(!_check_success(d, response)) {
-		json_delete(response);
+		json_decref(response);
 		return 0;
 	}
 
-	json_delete(response);
+	json_decref(response);
 	return 1;
 }
 
@@ -716,44 +697,36 @@ char *libdazeus_get_property(dazeus *d, const char *variable, dazeus_scope *s)
 {
 	d->error = 0;
 	// {'do':'property','params':['get','variable'],'scope':[...]}
-	JSONNODE *scope    = _add_scope(d, s);
+	json_t *scope    = _add_scope(d, s);
 	if(scope == NULL)
 		return NULL;
-	JSONNODE *fulljson = json_new(JSON_NODE);
-	JSONNODE *request  = json_new_a("do", "property");
-	JSONNODE *params   = json_new(JSON_ARRAY);
-	JSONNODE *p1       = json_new_a("", "get");
-	JSONNODE *p2       = json_new_a("", variable);
-	json_set_name(params, "params");
-	json_push_back(params, p1);
-	json_push_back(params, p2);
-	json_push_back(fulljson, request);
-	json_push_back(fulljson, params);
-	json_push_back(fulljson, scope);
+	json_t *fulljson = json_object();
+	json_object_set_new(fulljson, "do", json_string("property"));
+	json_object_set_new(fulljson, "scope", scope);
+	json_t *params   = json_array();
+	json_object_set_new(fulljson, "params", params);
+	json_array_append_new(params, json_string("get"));
+	json_array_append_new(params, json_string(variable));
 	_send(d, fulljson);
-	json_delete(fulljson);
+	json_decref(fulljson);
 
-	JSONNODE *response;
+	json_t *response;
 	if(!_read(d, &response)) {
 		return NULL;
 	}
 
 	if(!_check_success(d, response)) {
-		json_delete(response);
+		json_decref(response);
 		return NULL;
 	}
 
-	JSONNODE *value = json_pop_back(response, "value");
+	json_t *value = json_object_get(response, "value");
 	char *ret = NULL;
 	if(value) {
-		json_char *str = json_as_string(value);
-		ret = malloc(strlen(str) + 1);
-		strcpy(ret, str);
-		json_free(str);
+		ret = strdup(json_string_value(value));
 	}
 
-	json_delete(value);
-	json_delete(response);
+	json_decref(response);
 	return ret;
 }
 
@@ -764,36 +737,31 @@ int libdazeus_set_property(dazeus *d, const char *variable, const char *value, d
 {
 	d->error = 0;
 	// {'do':'property','params':['set','variable','value'],'scope':[...]}
-	JSONNODE *scope    = _add_scope(d, s);
+	json_t *scope    = _add_scope(d, s);
 	if(scope == NULL)
 		return 0;
-	JSONNODE *fulljson = json_new(JSON_NODE);
-	JSONNODE *request  = json_new_a("do", "property");
-	JSONNODE *params   = json_new(JSON_ARRAY);
-	JSONNODE *p1       = json_new_a("", "set");
-	JSONNODE *p2       = json_new_a("", variable);
-	JSONNODE *p3       = json_new_a("", value);
-	json_set_name(params, "params");
-	json_push_back(params, p1);
-	json_push_back(params, p2);
-	json_push_back(params, p3);
-	json_push_back(fulljson, request);
-	json_push_back(fulljson, params);
-	json_push_back(fulljson, scope);
+	json_t *fulljson = json_object();
+	json_object_set_new(fulljson, "do", json_string("property"));
+	json_object_set_new(fulljson, "scope", scope);
+	json_t *params   = json_array();
+	json_array_append_new(params, json_string("set"));
+	json_array_append_new(params, json_string(variable));
+	json_array_append_new(params, json_string(value));
+	json_object_set_new(fulljson, "params", params);
 	_send(d, fulljson);
-	json_delete(fulljson);
+	json_decref(fulljson);
 
-	JSONNODE *response;
+	json_t *response;
 	if(!_read(d, &response)) {
 		return 0;
 	}
 
 	if(!_check_success(d, response)) {
-		json_delete(response);
+		json_decref(response);
 		return 0;
 	}
 
-	json_delete(response);
+	json_decref(response);
 	return 1;
 }
 
@@ -804,34 +772,30 @@ int libdazeus_unset_property(dazeus *d, const char *variable, dazeus_scope *s)
 {
 	d->error = 0;
 	// {'do':'property','params':['unset','variable'],'scope':[...]}
-	JSONNODE *scope    = _add_scope(d, s);
+	json_t *scope    = _add_scope(d, s);
 	if(scope == NULL)
 		return 0;
-	JSONNODE *fulljson = json_new(JSON_NODE);
-	JSONNODE *request  = json_new_a("do", "property");
-	JSONNODE *params   = json_new(JSON_ARRAY);
-	JSONNODE *p1       = json_new_a("", "unset");
-	JSONNODE *p2       = json_new_a("", variable);
-	json_set_name(params, "params");
-	json_push_back(params, p1);
-	json_push_back(params, p2);
-	json_push_back(fulljson, request);
-	json_push_back(fulljson, params);
-	json_push_back(fulljson, scope);
+	json_t *fulljson = json_object();
+	json_object_set_new(fulljson, "do", json_string("property"));
+	json_object_set_new(fulljson, "scope", scope);
+	json_t *params   = json_array();
+	json_array_append_new(params, json_string("unset"));
+	json_array_append_new(params, json_string(variable));
+	json_object_set_new(fulljson, "params", params);
 	_send(d, fulljson);
-	json_delete(fulljson);
+	json_decref(fulljson);
 
-	JSONNODE *response;
+	json_t *response;
 	if(!_read(d, &response)) {
 		return 0;
 	}
 
 	if(!_check_success(d, response)) {
-		json_delete(response);
+		json_decref(response);
 		return 0;
 	}
 
-	json_delete(response);
+	json_decref(response);
 	return 1;
 }
 
@@ -842,28 +806,25 @@ int libdazeus_subscribe(dazeus *d, const char *event)
 {
 	d->error = 0;
 	// {'do':'subscribe','params':['event']
-	JSONNODE *fulljson = json_new(JSON_NODE);
-	JSONNODE *request  = json_new_a("do", "subscribe");
-	JSONNODE *params   = json_new(JSON_ARRAY);
-	JSONNODE *p1       = json_new_a("", event);
-	json_set_name(params, "params");
-	json_push_back(params, p1);
-	json_push_back(fulljson, request);
-	json_push_back(fulljson, params);
+	json_t *fulljson = json_object();
+	json_object_set_new(fulljson, "do", json_string("subscribe"));
+	json_t *params   = json_array();
+	json_array_append_new(params, json_string(event));
+	json_object_set_new(fulljson, "params", params);
 	_send(d, fulljson);
-	json_delete(fulljson);
+	json_decref(fulljson);
 
-	JSONNODE *response;
+	json_t *response;
 	if(!_read(d, &response)) {
 		return 0;
 	}
 
 	if(!_check_success(d, response)) {
-		json_delete(response);
+		json_decref(response);
 		return 0;
 	}
 
-	json_delete(response);
+	json_decref(response);
 	return 1;
 }
 
@@ -881,22 +842,22 @@ dazeus_event *libdazeus_handle_event(dazeus *d, int timeout)
 	if(d->event == 0) {
 		// Wait for a new event to come in
 		assert(d->lastEvent == 0);
-		JSONNODE *res = 0;
+		json_t *res = 0;
 		if(_readPacket(d, timeout, &res) <= 0) {
 			// read error
 			return NULL;
 		}
 		if(res == NULL)
 			return NULL;
-		JSONNODE_ITERATOR eventIt = json_find(res, "event");
-		if(eventIt == json_end(res)) {
+		json_t *event = json_object_get(res, "event");
+		if(!event) {
 			d->error = "Error: Out of bound non-event packet received in handle_event";
 			return NULL;
 		}
 		dazeus_event *e = _event_from_json(d, res);
 		d->event = e;
 		d->lastEvent = e;
-		json_delete(res);
+		json_decref(res);
 	}
 
 	// return the first one
@@ -927,90 +888,4 @@ void *_ensure_space(void *buf, int *cursize, int newsize) {
 		buf = realloc(buf, *cursize);
 	}
 	return buf;
-}
-
-/**
- * Work around a UTF-8 encoding bug in the JSON library. This function splits
- * up all multi-byte characters in the incoming string, and turns them back
- * into single byte encodings. For example, \u0192 is turned back into
- * \u00c6\u0092.
- */
-char *_workaround_json_encoding_bug(char *buf, int *bufsize) {
-	int orig_size = *bufsize;
-
-	int newbuf_size = *bufsize;
-	char *newbuf = (char*)malloc(newbuf_size + 1);
-	int newbuf_i = 0;
-
-	int escaped = 0;
-	int i;
-	for(i = 0; i < orig_size; ++i) {
-		char c = buf[i];
-		newbuf = _ensure_space(newbuf, &newbuf_size, newbuf_i + 1);
-		if(escaped) {
-			escaped = 0;
-			if(c == 'u') {
-				char codept_c[5];
-				uint32_t codept;
-				memcpy(codept_c, buf + i + 1, 4);
-				codept_c[4] = 0;
-				i += 4;
-				sscanf(codept_c, "%x", &codept);
-				if(codept <= 0x7f) {
-					// Single character already, just write it
-					newbuf = _ensure_space(newbuf, &newbuf_size, newbuf_i + 5);
-					newbuf[newbuf_i] = 'u';
-					memcpy(newbuf + newbuf_i + 1, codept_c, 4);
-					newbuf_i += 5;
-				} else {
-					// Multiple characters will need to be written
-					// First byte:  [num_bytes times 1]0[first 7-num_bytes bits]
-					// Other bytes: 10[next 6 bits]
-					int num_bytes = 0;
-					uint8_t first_byte;
-					if(codept <= 0x7ff) {
-						num_bytes = 2;
-						first_byte = 0xc0;
-						codept <<= 21;
-					} else if(codept <= 0xffff) {
-						num_bytes = 3;
-						first_byte = 0xe0;
-						codept <<= 16;
-					} else if(codept <= 0x1fffff) {
-						num_bytes = 4;
-						first_byte = 0xf0;
-						codept <<= 11;
-					} else {
-						fprintf(stderr, "Number of bytes in UTF-8 character breaks RFC 3629\n");
-						assert(0);
-					}
-					newbuf = _ensure_space(newbuf, &newbuf_size, newbuf_i - 1 + (num_bytes * 6));
-					int bits_in_first = 7 - num_bytes;
-					first_byte |= (uint8_t) (codept >> (32 - bits_in_first));
-					sprintf(newbuf + newbuf_i, "u%04x", first_byte);
-					newbuf_i += 5;
-					int bits_done = bits_in_first;
-					for(; num_bytes > 1; --num_bytes) {
-						uint8_t next_byte = 0x80;
-						uint32_t shifted = codept << bits_done;
-						next_byte |= (uint8_t) (shifted >> 26);
-						sprintf(newbuf + newbuf_i, "\\u%04x", next_byte);
-						newbuf_i += 6;
-					}
-				}
-			} else {
-				newbuf[newbuf_i++] = c;
-			}
-		} else {
-			if(c == '\\') {
-				escaped = 1;
-			}
-			newbuf[newbuf_i++] = c;
-		}
-	}
-
-	*bufsize = newbuf_i;
-	free(buf);
-	newbuf[newbuf_i] = 0;
-	return newbuf;
 }
