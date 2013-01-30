@@ -302,7 +302,8 @@ dazeus_event *_event_from_json(dazeus *d, json_t *event) {
 
 	dazeus_stringlist *params = 0;
 	dazeus_stringlist *cur = 0;
-	for(int i = 0; i < json_array_size(paramsIt); ++i) {
+	int i;
+	for(i = 0; i < json_array_size(paramsIt); ++i) {
 		json_t *curParam = json_array_get(paramsIt, i);
 		dazeus_stringlist *new = malloc(sizeof(dazeus_stringlist));
 		new->next = 0;
@@ -391,7 +392,8 @@ dazeus_stringlist *_jsonarray_to_stringlist(json_t *array) {
 
 	dazeus_stringlist *first = 0;
 	dazeus_stringlist *cur = first;
-	for(int i = 0; i < json_array_size(array); ++i) {
+	int i;
+	for(i = 0; i < json_array_size(array); ++i) {
 		json_t *item = json_array_get(array, i);
 
 		dazeus_stringlist *new = malloc(sizeof(dazeus_stringlist));
