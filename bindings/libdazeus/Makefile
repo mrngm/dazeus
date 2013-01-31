@@ -1,14 +1,30 @@
-CFLAGS = -Wall -Iinclude -Icontrib/libjson $(EXTRACFLAGS)
+CFLAGS = -Wall -Iinclude -Icontrib/jansson/src $(EXTRACFLAGS)
+JANSSON_CFLAGS=-Icontrib/jansson/src
 
-lib/libdazeus.a: lib/libdazeus.o contrib/libjson/libjson.a
+JANSSON_FILES = contrib/jansson/src/dump.c \
+	contrib/jansson/src/error.c \
+	contrib/jansson/src/hashtable.c \
+	contrib/jansson/src/load.c \
+	contrib/jansson/src/memory.c \
+	contrib/jansson/src/pack_unpack.c \
+	contrib/jansson/src/strbuffer.c \
+	contrib/jansson/src/strconv.c \
+	contrib/jansson/src/utf.c \
+	contrib/jansson/src/value.c
+
+JANSSON_OBJECTS = $(JANSSON_FILES:.c=.o)
+
+lib/libdazeus.a: lib/libdazeus.o $(JANSSON_OBJECTS)
+	ar cur lib/libdazeus.a lib/libdazeus.o $(JANSSON_OBJECTS)
+
+contrib/jansson/src/%.o: $(@:.o=.c) contrib/jansson/src/jansson_config.h
+	$(CC) -c -o $@ $(@:.o=.c) $(JANSSON_CFLAGS)
+
+contrib/jansson/src/jansson_config.h: jansson_config.h
+	cp jansson_config.h $@
+
+lib/libdazeus.o: src/libdazeus.c include/libdazeus.h contrib/jansson/src/jansson_config.h
 	mkdir -p lib
-	cp contrib/libjson/libjson.a lib/libdazeus.a
-	ar cur lib/libdazeus.a lib/libdazeus.o
-
-contrib/libjson/libjson.a:
-	make -C contrib/libjson libjson.a
-
-lib/libdazeus.o: src/libdazeus.c include/libdazeus.h
 	$(CC) -c -o lib/libdazeus.o src/libdazeus.c $(CFLAGS)
 
 examples/networks: examples/networks.c include/libdazeus.h lib/libdazeus.a
@@ -29,12 +45,12 @@ examples/scope: examples/scope.c include/libdazeus.h lib/libdazeus.a
 .PHONY : clean distclean
 clean:
 	rm -f lib/libdazeus.o
+	rm -f $(JANSSON_OBJECTS)
 	rm -rf examples/networks.dSYM
 	rm -rf examples/counter.dSYM
 	rm -rf examples/counterreset.dSYM
 	rm -rf examples/monitor.dSYM
 	rm -rf examples/scope.dSYM
-	make -C contrib/libjson clean
 
 distclean: clean
 	rm -f lib/libdazeus.a
